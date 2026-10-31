@@ -1,0 +1,5 @@
+*.o
+mkfs.nmglfdfs
+nmglfdfs
+nmglfdfs-ctl
+nmglfdfs-selftest
