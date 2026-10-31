@@ -5,20 +5,14 @@ extern memset, memcpy, sha256_K
 section .bss
 sha_H:      resd 8
 sha_W:      resd 64
-sha_msg:    resb 320
+sha_blk:    resb 64
+sha_nblk:   resq 1
+sha_total:  resq 1
 
 section .text
-global sha256_oneshot
+global sha256_init, sha256_update, sha256_final, sha256_oneshot
 
-; rdi = dst (32 bytes), rsi = src, rdx = len (0..240)
-sha256_oneshot:
-    PROLOGUE 8
-    mov rbx, rdi
-    mov r12, rsi
-    mov r13, rdx
-    cmp r13, 240
-    ja .bad
-
+sha256_init:
     mov dword [rel sha_H+0], 0x6a09e667
     mov dword [rel sha_H+4], 0xbb67ae85
     mov dword [rel sha_H+8], 0x3c6ef372
@@ -27,64 +21,105 @@ sha256_oneshot:
     mov dword [rel sha_H+20], 0x9b05688c
     mov dword [rel sha_H+24], 0x1f83d9ab
     mov dword [rel sha_H+28], 0x5be0cd19
+    mov qword [rel sha_nblk], 0
+    mov qword [rel sha_total], 0
+    xor eax, eax
+    ret
 
-    lea rdi, [rel sha_msg]
-    xor esi, esi
-    mov edx, 320
-    call memset
-    lea rdi, [rel sha_msg]
-    mov rsi, r12
-    mov rdx, r13
+; rdi = data, rsi = len. Streaming, any length.
+sha256_update:
+    PROLOGUE 8
+    mov rbx, rdi
+    mov r12, rsi
+    add [rel sha_total], r12
+    mov rcx, [rel sha_nblk]
+    test rcx, rcx
+    jz .full
+    mov rax, 64
+    sub rax, rcx
+    mov rdx, r12
+    cmp rdx, rax
+    jbe .take
+    mov rdx, rax
+.take:
+    mov r13, rdx
+    lea rdi, [rel sha_blk]
+    add rdi, rcx
+    mov rsi, rbx
     call memcpy
-    lea rax, [rel sha_msg]
-    mov byte [rax+r13], 0x80
+    add rbx, r13
+    sub r12, r13
+    add [rel sha_nblk], r13
+    cmp qword [rel sha_nblk], 64
+    jb .done
+    lea rsi, [rel sha_blk]
+    call sha256_compress
+    mov qword [rel sha_nblk], 0
+.full:
+    cmp r12, 64
+    jb .tail
+    mov rsi, rbx
+    call sha256_compress
+    add rbx, 64
+    sub r12, 64
+    jmp .full
+.tail:
+    test r12, r12
+    jz .done
+    lea rdi, [rel sha_blk]
+    mov rsi, rbx
+    mov rdx, r12
+    call memcpy
+    mov [rel sha_nblk], r12
+.done:
+    xor eax, eax
+    EPILOGUE 8
 
-    ; q = len + 1; pad so q % 64 == 56; total = q + 8
-    lea r14, [r13+1]
-    mov rax, r14
-    and eax, 63
-    cmp eax, 56
-    jb .lt
-    ja .gt
-    jmp .lenf
-.lt:
-    mov ecx, 56
-    sub ecx, eax
-    add r14, rcx
-    jmp .lenf
-.gt:
-    mov ecx, 64
-    sub ecx, eax
-    add ecx, 56
-    add r14, rcx
-.lenf:
-    ; bit length at total-8, big endian. total = r14+8, field at r14
-    mov rax, r13
+; rdi = dst 32 bytes
+sha256_final:
+    PROLOGUE 8
+    mov rbx, rdi
+    mov rcx, [rel sha_nblk]
+    lea r11, [rel sha_blk]
+    mov byte [r11+rcx], 0x80
+    inc rcx
+    mov [rel sha_nblk], rcx
+    cmp rcx, 56
+    jbe .padlen
+    lea rdi, [rel sha_blk]
+    add rdi, rcx
+    xor esi, esi
+    mov rax, 64
+    sub rax, rcx
+    mov rdx, rax
+    call memset
+    lea rsi, [rel sha_blk]
+    call sha256_compress
+    mov qword [rel sha_nblk], 0
+.padlen:
+    mov rcx, [rel sha_nblk]
+    lea rdi, [rel sha_blk]
+    add rdi, rcx
+    xor esi, esi
+    mov rax, 56
+    sub rax, rcx
+    mov rdx, rax
+    call memset
+    mov rax, [rel sha_total]
     shl rax, 3
-    ; store 8 bytes BE at sha_msg+r14
     mov rcx, 8
-    lea r8, [rel sha_msg]
-    add r8, r14
-.bestore:
+    lea r8, [rel sha_blk]
+    add r8, 56
+.be:
     dec rcx
     mov rdx, rax
     and edx, 0xff
     mov [r8+rcx], dl
     shr rax, 8
     test rcx, rcx
-    jnz .bestore
-
-    lea r15, [r14+8]          ; total padded length
-    xor r14, r14              ; offset
-.blocks:
-    cmp r14, r15
-    jae .out
-    lea rsi, [rel sha_msg]
-    add rsi, r14
+    jnz .be
+    lea rsi, [rel sha_blk]
     call sha256_compress
-    add r14, 64
-    jmp .blocks
-.out:
     xor ecx, ecx
     lea rdx, [rel sha_H]
 .sw:
@@ -98,8 +133,20 @@ sha256_oneshot:
 .ok:
     xor eax, eax
     EPILOGUE 8
-.bad:
-    mov rax, -EINVAL
+
+; rdi = dst (32 bytes), rsi = src, rdx = len
+sha256_oneshot:
+    PROLOGUE 8
+    mov rbx, rdi
+    mov r12, rsi
+    mov r13, rdx
+    call sha256_init
+    mov rdi, r12
+    mov rsi, r13
+    call sha256_update
+    mov rdi, rbx
+    call sha256_final
+    xor eax, eax
     EPILOGUE 8
 
 ; rsi = 64-byte block. Updates sha_H. Leaf except it uses only regs/bss.

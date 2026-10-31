@@ -1,9 +1,11 @@
 %include "sys.inc"
 
-extern memcpy, memset, sha256_oneshot
+extern memcpy, memset, sha256_oneshot, sha256_init, sha256_update, sha256_final
 
 section .bss
-hmac_cat:   resb 256
+hmac_ipad:  resb 64
+hmac_opad:  resb 64
+hmac_inner: resb 32
 hmac_tmp:   resb 32
 kdf_msg:    resb 160
 kdf_u:      resb 32
@@ -22,92 +24,106 @@ lbl_sleep:    db "SLEEP-SEAL-NMGL"
 lbl_sleep_len equ $ - lbl_sleep
 
 section .text
-global hmac_sha256, pbkdf2_sha256
+global hmac_sha256, hmac_init, hmac_update, hmac_final, pbkdf2_sha256
 global derive_verifier, derive_wrap_key, derive_data_key, derive_meta_key, derive_sleep_key
 
 ; rdi dst32, rsi key, rdx keylen, rcx msg, r8 msglen
 hmac_sha256:
-    PROLOGUE 216
+    PROLOGUE 8
+    mov rbx, rdi
+    mov r12, rcx
+    mov r13, r8
+    mov rdi, rsi
+    mov rsi, rdx
+    call hmac_init
+    test eax, eax
+    jnz .ret
+    mov rdi, r12
+    mov rsi, r13
+    call hmac_update
+    mov rdi, rbx
+    call hmac_final
+    xor eax, eax
+.ret:
+    EPILOGUE 8
+
+; rdi key, rsi keylen. Starts the inner hash (ipad already absorbed).
+hmac_init:
+    PROLOGUE 8
     mov rbx, rdi
     mov r12, rsi
-    mov r13, rdx
-    mov r14, rcx
-    mov r15, r8
-    cmp r15, 160
+    cmp r12, 128
     ja .bad
-    cmp r13, 128
-    ja .bad
-
-    lea rdi, [rsp]
-    xor esi, esi
-    mov edx, 192
-    call memset
-
-    cmp r13, 64
+    cmp r12, 64
     jbe .shortk
     lea rdi, [rel hmac_tmp]
-    mov rsi, r12
-    mov rdx, r13
+    mov rsi, rbx
+    mov rdx, r12
     call sha256_oneshot
     test eax, eax
-    jnz .bad
-    lea rdi, [rsp]
-    lea rsi, [rel hmac_tmp]
-    mov edx, 32
-    call memcpy
-    jmp .pads
+    jnz .ret
+    lea rbx, [rel hmac_tmp]
+    mov r12d, 32
 .shortk:
-    lea rdi, [rsp]
-    mov rsi, r12
-    mov rdx, r13
+    lea rdi, [rel hmac_ipad]
+    xor esi, esi
+    mov edx, 128
+    call memset
+    lea rdi, [rel hmac_ipad]
+    mov rsi, rbx
+    mov rdx, r12
     call memcpy
-.pads:
+    lea rdi, [rel hmac_opad]
+    mov rsi, rbx
+    mov rdx, r12
+    call memcpy
     xor ecx, ecx
+    lea r8, [rel hmac_ipad]
+    lea r9, [rel hmac_opad]
 .pad:
     cmp ecx, 64
-    je .inner
-    mov al, [rsp+rcx]
+    je .go
+    mov al, [r8+rcx]
     mov dl, al
     xor al, 0x36
-    mov [rsp+64+rcx], al
+    mov [r8+rcx], al
     xor dl, 0x5c
-    mov [rsp+128+rcx], dl
+    mov [r9+rcx], dl
     inc ecx
     jmp .pad
-.inner:
-    lea rdi, [rel hmac_cat]
-    lea rsi, [rsp+64]
-    mov edx, 64
-    call memcpy
-    lea rdi, [rel hmac_cat]
-    add rdi, 64
-    mov rsi, r14
-    mov rdx, r15
-    call memcpy
-    lea rdi, [rel hmac_tmp]
-    lea rsi, [rel hmac_cat]
-    lea rdx, [r15+64]
-    call sha256_oneshot
-    test eax, eax
-    jnz .bad
-
-    lea rdi, [rel hmac_cat]
-    lea rsi, [rsp+128]
-    mov edx, 64
-    call memcpy
-    lea rdi, [rel hmac_cat]
-    add rdi, 64
-    lea rsi, [rel hmac_tmp]
-    mov edx, 32
-    call memcpy
-    mov rdi, rbx
-    lea rsi, [rel hmac_cat]
-    mov edx, 96
-    call sha256_oneshot
-    EPILOGUE 216
+.go:
+    call sha256_init
+    lea rdi, [rel hmac_ipad]
+    mov esi, 64
+    call sha256_update
+    xor eax, eax
+    jmp .ret
 .bad:
     mov rax, -EINVAL
-    EPILOGUE 216
+.ret:
+    EPILOGUE 8
+
+; rdi data, rsi len
+hmac_update:
+    jmp sha256_update
+
+; rdi dst32
+hmac_final:
+    PROLOGUE 8
+    mov rbx, rdi
+    lea rdi, [rel hmac_inner]
+    call sha256_final
+    call sha256_init
+    lea rdi, [rel hmac_opad]
+    mov esi, 64
+    call sha256_update
+    lea rdi, [rel hmac_inner]
+    mov esi, 32
+    call sha256_update
+    mov rdi, rbx
+    call sha256_final
+    xor eax, eax
+    EPILOGUE 8
 
 ; PBKDF2-HMAC-SHA256, dkLen = 32 (one block, block index 1).
 ; rdi dst, rsi pass, rdx passlen, rcx salt, r8 saltlen, r9 iters

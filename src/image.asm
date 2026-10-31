@@ -2,6 +2,7 @@
 
 extern memcpy, memset, memcmp, ct_memeq
 extern crc32c, chacha20_xor, pbkdf2_sha256
+extern hmac_init, hmac_update, hmac_final
 extern derive_verifier, derive_wrap_key, derive_data_key, derive_meta_key, derive_sleep_key
 extern fill_random, now_ms
 extern pass_buf, pass_len
@@ -45,6 +46,7 @@ node_io:            resb BLOCK_SIZE
 bitmap_mem:         resb MAX_BITMAP_BLOCKS * BLOCK_SIZE
 wrap_key_buf:       resb 32
 nonce_tmp:          resb 16
+node_mac:           resb 32
 global dbg_b
 dbg_b:              resq 1
 
@@ -212,6 +214,20 @@ node_write:
     mov r8, r12
     xor r9d, r9d
     call chacha20_xor
+    lea rdi, [rel fs_meta_key]
+    mov esi, 32
+    call hmac_init
+    test eax, eax
+    jnz .ret
+    lea rdi, [rel node_io+8]
+    mov esi, MAC_OFF-8
+    call hmac_update
+    lea rdi, [rel node_mac]
+    call hmac_final
+    lea rdi, [rel node_io+MAC_OFF]
+    lea rsi, [rel node_mac]
+    mov edx, MAC_LEN
+    call memcpy
     lea rdi, [rel node_io+8]
     mov esi, BLOCK_SIZE-8
     call crc32c
@@ -219,6 +235,7 @@ node_write:
     mov rdi, [rel node_io+NH_BYTENR]
     lea rsi, [rel node_io]
     call block_write
+.ret:
     EPILOGUE 8
 
 ; rdi = bn, rsi = dst plaintext. 0 or -errno
@@ -244,6 +261,22 @@ node_read:
     mov [r12+NH_CRC], r13d
     cmp eax, r13d
     jne .badcrc
+    lea rdi, [rel fs_meta_key]
+    mov esi, 32
+    call hmac_init
+    test eax, eax
+    jnz .ret
+    lea rdi, [r12+8]
+    mov esi, MAC_OFF-8
+    call hmac_update
+    lea rdi, [rel node_mac]
+    call hmac_final
+    lea rdi, [rel node_mac]
+    lea rsi, [r12+MAC_OFF]
+    mov edx, MAC_LEN
+    call ct_memeq
+    test eax, eax
+    jnz .badmac
     movzx eax, word [r12+NH_NITEMS]
     cmp ax, MAX_LEAF_ITEMS
     ja .badn
@@ -269,6 +302,9 @@ node_read:
     jmp .io
 .badcrc:
     mov qword [rel dbg_b], 3
+    jmp .io
+.badmac:
+    mov qword [rel dbg_b], 5
     jmp .io
 .badn:
     mov qword [rel dbg_b], 4

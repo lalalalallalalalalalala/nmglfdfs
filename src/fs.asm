@@ -1,6 +1,7 @@
 %include "sys.inc"
 
-extern memcpy, memset, memcmp, crc32c, now_ms, pipeline_apply, strlen
+extern memcpy, memset, memcmp, ct_memeq, crc32c, now_ms, pipeline_apply, strlen
+extern hmac_init, hmac_update, hmac_final
 extern block_read, block_write, alloc_block, free_block, bitmap_write, super_store
 extern btree_get, btree_insert, btree_update, btree_delete, tree_walk
 extern fs_prepare_admin, fs_close, fill_random
@@ -14,9 +15,11 @@ ino_buf:        resb 64
 global dbg_q
 dbg_q:          resq 1
 dir_buf:        resb 512
-ext_buf:        resb 32
+ext_buf:        resb 64
 plain_blk:      resb BLOCK_SIZE
 cipher_blk:     resb BLOCK_SIZE
+mac_hdr:        resb 64
+mac_out:        resb 32
 cparam:         resb 80
 scan_dir:       resq 1
 scan_name:      resq 1
@@ -35,6 +38,7 @@ new_extents:    resq 1
 section .data
 global fs_stage
 fs_stage: db 0
+mac_label: db "NMGLMAC1"
 
 section .text
 global fs_lookup, fs_create, fs_mkdir, fs_unlink, fs_rmdir
@@ -655,6 +659,78 @@ apply_data:
     call pipeline_apply
     EPILOGUE 8
 
+; HMAC-SHA256(data_key, header || ciphertext), truncated to MAC_LEN.
+; Header is NMGLMAC1 || disk || time || gen || ino || fileoff || method || plen || crc.
+; rdi = ino, rsi = file offset, rdx = 0 verify / 1 seal into ext_buf+EXT_MAC.
+; cipher_blk and ext_buf are already filled. 0 or -EIO/-errno.
+auth_extent:
+    PROLOGUE 24
+    mov [rsp], rdi
+    mov [rsp+8], rsi
+    mov [rsp+16], rdx
+    lea rdi, [rel fs_data_key]
+    mov esi, 32
+    call hmac_init
+    test eax, eax
+    jnz .ret
+    lea rdi, [rel mac_hdr]
+    xor esi, esi
+    mov edx, 64
+    call memset
+    lea rdi, [rel mac_hdr]
+    lea rsi, [rel mac_label]
+    mov edx, 8
+    call memcpy
+    lea r11, [rel mac_hdr]
+    lea r12, [rel ext_buf]
+    mov rax, [r12+EXT_DISK]
+    mov [r11+8], rax
+    mov rax, [r12+EXT_TIME]
+    mov [r11+16], rax
+    mov rax, [r12+EXT_GEN]
+    mov [r11+24], rax
+    mov rax, [rsp]
+    mov [r11+32], rax
+    mov rax, [rsp+8]
+    mov [r11+40], rax
+    movzx eax, byte [r12+EXT_METHOD]
+    mov [r11+48], al
+    movzx eax, word [r12+EXT_PLEN]
+    mov [r11+50], ax
+    mov eax, [r12+EXT_CRC]
+    mov [r11+52], eax
+    lea rdi, [rel mac_hdr]
+    mov esi, 56
+    call hmac_update
+    lea rdi, [rel cipher_blk]
+    mov esi, BLOCK_SIZE
+    call hmac_update
+    lea rdi, [rel mac_out]
+    call hmac_final
+    cmp qword [rsp+16], 0
+    jne .seal
+    lea rdi, [rel mac_out]
+    lea rsi, [rel ext_buf]
+    add rsi, EXT_MAC
+    mov edx, MAC_LEN
+    call ct_memeq
+    test eax, eax
+    jnz .bad
+    xor eax, eax
+    jmp .ret
+.seal:
+    lea rdi, [rel ext_buf]
+    add rdi, EXT_MAC
+    lea rsi, [rel mac_out]
+    mov edx, MAC_LEN
+    call memcpy
+    xor eax, eax
+    jmp .ret
+.bad:
+    mov rax, -EIO
+.ret:
+    EPILOGUE 24
+
 ; rdi ino, rsi offset, rdx buf, rcx len -> bytes or -errno
 fs_read:
     PROLOGUE 40
@@ -723,6 +799,12 @@ fs_read:
     mov rdi, [r11+EXT_DISK]
     lea rsi, [rel cipher_blk]
     call block_read
+    test eax, eax
+    jnz .ret
+    mov rdi, [rsp]
+    mov rsi, r12
+    xor edx, edx
+    call auth_extent
     test eax, eax
     jnz .ret
     lea r11, [rel cparam]
@@ -844,6 +926,12 @@ fs_write:
     call block_read
     test eax, eax
     jnz .ret
+    mov rdi, [rsp]
+    mov rsi, r12
+    xor edx, edx
+    call auth_extent
+    test eax, eax
+    jnz .ret
     lea r11, [rel cparam]
     mov qword [r11+PP_DEC], 1
     mov rax, [rsp]
@@ -914,8 +1002,15 @@ fs_write:
     jz .nospc
     lea r11, [rel ext_buf]
     mov [r11+EXT_DISK], rax
+    mov rdi, [rsp]
+    mov rsi, r12
+    mov edx, 1
+    call auth_extent
+    test eax, eax
+    jnz .reldata
     mov byte [rel fs_stage], 'W'
-    mov rdi, rax
+    lea r11, [rel ext_buf]
+    mov rdi, [r11+EXT_DISK]
     lea rsi, [rel cipher_blk]
     call block_write
     test eax, eax
@@ -1083,6 +1178,12 @@ fs_truncate:
     call block_read
     test eax, eax
     jnz .ret
+    mov rdi, [rsp]
+    mov rsi, r12
+    xor edx, edx
+    call auth_extent
+    test eax, eax
+    jnz .ret
     lea r11, [rel cparam]
     mov qword [r11+PP_DEC], 1
     mov rax, [rsp]
@@ -1146,7 +1247,21 @@ fs_truncate:
     mov rbx, [r11+EXT_DISK]
     lea r11, [rel ext_buf]
     mov [r11+EXT_DISK], rax
-    mov rdi, rax
+    mov rdi, [rsp]
+    mov rsi, r12
+    mov edx, 1
+    call auth_extent
+    test eax, eax
+    jz .tw
+    mov r15, rax
+    lea r11, [rel ext_buf]
+    mov rdi, [r11+EXT_DISK]
+    call free_block
+    mov rax, r15
+    jmp .ret
+.tw:
+    lea r11, [rel ext_buf]
+    mov rdi, [r11+EXT_DISK]
     lea rsi, [rel cipher_blk]
     call block_write
     mov rdi, [rsp]

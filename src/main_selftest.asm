@@ -18,6 +18,8 @@ fails:      resq 1
 section .data
 name_sha0:  db "sha256 empty", 10, 0
 name_sha1:  db "sha256 abc", 10, 0
+name_sha2:  db "sha256 56", 10, 0
+name_sha3:  db "sha256 100", 10, 0
 name_crc:   db "crc32c", 10, 0
 name_chacha: db "chacha20 rfc", 10, 0
 name_pbk1:  db "pbkdf2 c=1", 10, 0
@@ -65,6 +67,18 @@ chacha_exp:
 chacha_nonce:
     db 0x00,0x00,0x00,0x09,0x00,0x00,0x00,0x4a,0x00,0x00,0x00,0x00
 abc_msg:    db "abc"
+sha2_msg:   db "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"
+sha2_exp:
+    db 0x24,0x8d,0x6a,0x61,0xd2,0x06,0x38,0xb8
+    db 0xe5,0xc0,0x26,0x93,0x0c,0x3e,0x60,0x39
+    db 0xa3,0x3c,0xe4,0x59,0x64,0xff,0x21,0x67
+    db 0xf6,0xec,0xed,0xd4,0x19,0xdb,0x06,0xc1
+sha3_msg:   times 100 db "a"
+sha3_exp:
+    db 0x28,0x16,0x59,0x78,0x88,0xe4,0xa0,0xd3
+    db 0xa3,0x6b,0x82,0xb8,0x33,0x16,0xab,0x32
+    db 0x68,0x0e,0xb8,0xf0,0x0f,0x8c,0xd3,0xb9
+    db 0x04,0xd6,0x81,0x24,0x6d,0x28,0x5a,0x0e
 crc_msg:    db "123456789"
 pass_msg:   db "password"
 salt_msg:   db "salt"
@@ -106,6 +120,26 @@ app_main:
     lea rsi, [rel sha1_exp]
     mov edx, 32
     lea rcx, [rel name_sha1]
+    call expect_mem
+
+    lea rdi, [rel hashb]
+    lea rsi, [rel sha2_msg]
+    mov edx, 56
+    call sha256_oneshot
+    lea rdi, [rel hashb]
+    lea rsi, [rel sha2_exp]
+    mov edx, 32
+    lea rcx, [rel name_sha2]
+    call expect_mem
+
+    lea rdi, [rel hashb]
+    lea rsi, [rel sha3_msg]
+    mov edx, 100
+    call sha256_oneshot
+    lea rdi, [rel hashb]
+    lea rsi, [rel sha3_exp]
+    mov edx, 32
+    lea rcx, [rel name_sha3]
     call expect_mem
 
     lea rdi, [rel crc_msg]

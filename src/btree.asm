@@ -3,8 +3,8 @@
 ; Copy-on-write B-tree. Keys are (objectid, type, offset), BTRFS order.
 ; Leaf items carry a variable payload. Internal nodes are fixed 40-byte records.
 ; A leaf split of the root promotes a new internal root. Further splits insert a
-; sibling into the parent. If that parent is already full the insert returns
-; ENOSPC and rolls the allocation back (fanout is 101; enough for the prototype).
+; sibling into the parent. A full internal node splits the same way and, when
+; the node is the root, grows the tree by one level.
 
 extern node_read, node_write, alloc_block, bit_clear, free_block
 extern super_store, bitmap_write
@@ -32,7 +32,10 @@ item_used:      resq 1
 saved_root:     resq 1
 saved_gen:      resq 1
 saved_free:     resq 1
-cow_new:        resq 16
+cow_new:        resq 32
+int_scratch:    resb 110 * INT_IH
+sep_key:        resb 32
+split_right:    resq 1
 cow_new_n:      resq 1
 split_buf:      resb BLOCK_SIZE
 root_buf:       resb BLOCK_SIZE
@@ -45,6 +48,7 @@ seek_off:       resq 1
 
 section .text
 global btree_get, btree_insert, btree_update, btree_delete, tree_walk
+global btree_root_level, btree_root_nitems
 
 ; rdi index -> rax pointer
 path_ptr:
@@ -447,7 +451,7 @@ alloc_tracked:
     test rax, rax
     jz .d
     mov rcx, [rel cow_new_n]
-    cmp rcx, 16
+    cmp rcx, 32
     jae .full
     lea r11, [rel cow_new]
     mov [r11+rcx*8], rax
@@ -772,22 +776,23 @@ promote_root:
 .ret:
     EPILOGUE 8
 
-; rdi = parent path index, rsi = right child bn. Right key at [r13].
+; rdi = parent path index, rsi = right child bn. Right key at [r13] (IM_*).
+; Splits the parent when it already holds MAX_INT_ITEMS children.
 parent_insert:
-    PROLOGUE 8
-    mov rbx, rdi
-    mov r12, rsi
-    mov rdi, rbx
+    PROLOGUE 24
+    mov [rsp], rdi
+    mov [rsp+8], rsi
+    mov rdi, [rsp]
     call path_ptr
     mov r14, rax
     movzx eax, word [r14+NH_NITEMS]
-    cmp eax, 100
-    jae .nospc
+    cmp eax, MAX_INT_ITEMS
+    jae .split
     lea r11, [rel path_slot]
+    mov rbx, [rsp]
     mov rcx, [r11+rbx*8]
-    inc rcx                     ; insert after the left child
+    inc rcx
     mov r15, rcx
-    ; shift records [r15, nitems) up by one
     movzx eax, word [r14+NH_NITEMS]
     sub rax, r15
     jbe .nos
@@ -799,6 +804,9 @@ parent_insert:
     add rsi, rax
     lea rdi, [rsi+INT_IH]
     call memmove
+    mov rdi, [rsp]
+    call path_ptr
+    mov r14, rax
 .nos:
     mov rax, r15
     imul rax, INT_IH
@@ -806,18 +814,203 @@ parent_insert:
     add rdi, rax
     mov rax, [r13+IM_OBJ]
     mov [rdi+II_OBJ], rax
+    mov qword [rdi+II_TYPE], 0
     movzx eax, byte [r13+IM_TYPE]
     mov [rdi+II_TYPE], al
     mov rax, [r13+IM_OFF]
     mov [rdi+II_OFF], rax
-    mov [rdi+II_CHILD], r12
+    mov rax, [rsp+8]
+    mov [rdi+II_CHILD], rax
     mov rax, [rel fs_generation]
     mov [rdi+II_GEN], rax
     inc word [r14+NH_NITEMS]
     xor eax, eax
-    EPILOGUE 8
+    jmp .ret
+.split:
+    movzx r15, word [r14+NH_NITEMS]
+    lea rdi, [rel int_scratch]
+    lea rsi, [r14+PAYLOAD_OFF]
+    mov rax, r15
+    imul rax, INT_IH
+    mov rdx, rax
+    call memcpy
+    mov rbx, [rsp]
+    lea r11, [rel path_slot]
+    mov rcx, [r11+rbx*8]
+    inc rcx
+    mov [rsp+16], rcx
+    mov rax, r15
+    sub rax, rcx
+    jbe .sins
+    imul rax, INT_IH
+    mov rdx, rax
+    mov rax, [rsp+16]
+    imul rax, INT_IH
+    lea rsi, [rel int_scratch]
+    add rsi, rax
+    lea rdi, [rsi+INT_IH]
+    call memmove
+.sins:
+    mov rax, [rsp+16]
+    imul rax, INT_IH
+    lea rdi, [rel int_scratch]
+    add rdi, rax
+    mov rax, [r13+IM_OBJ]
+    mov [rdi+II_OBJ], rax
+    mov qword [rdi+II_TYPE], 0
+    movzx eax, byte [r13+IM_TYPE]
+    mov [rdi+II_TYPE], al
+    mov rax, [r13+IM_OFF]
+    mov [rdi+II_OFF], rax
+    mov rax, [rsp+8]
+    mov [rdi+II_CHILD], rax
+    mov rax, [rel fs_generation]
+    mov [rdi+II_GEN], rax
+    inc r15
+    mov r12, r15
+    shr r12, 1
+    test r12, r12
+    jz .nospc
+    mov rdi, [rsp]
+    call path_ptr
+    mov r14, rax
+    lea rdi, [r14+PAYLOAD_OFF]
+    xor esi, esi
+    mov edx, PAYLOAD_SIZE
+    call memset
+    lea rdi, [r14+PAYLOAD_OFF]
+    lea rsi, [rel int_scratch]
+    mov rax, r12
+    imul rax, INT_IH
+    mov rdx, rax
+    call memcpy
+    mov rdi, [rsp]
+    call path_ptr
+    mov r14, rax
+    mov [r14+NH_NITEMS], r12w
+    call alloc_tracked
+    test rax, rax
+    jz .nospc
+    mov [rel split_right], rax
+    lea rdi, [rel split_buf]
+    mov rsi, rax
+    movzx edx, byte [r14+NH_LEVEL]
+    call node_clear
+    lea rdi, [rel split_buf]
+    add rdi, PAYLOAD_OFF
+    mov rax, r12
+    imul rax, INT_IH
+    lea rsi, [rel int_scratch]
+    add rsi, rax
+    mov rax, r15
+    sub rax, r12
+    imul rax, INT_IH
+    mov rdx, rax
+    call memcpy
+    mov rax, r15
+    sub rax, r12
+    lea r11, [rel split_buf]
+    mov [r11+NH_NITEMS], ax
+    lea rdi, [rel split_buf]
+    call node_write
+    test eax, eax
+    jnz .ret
+    mov rax, r12
+    imul rax, INT_IH
+    lea r11, [rel int_scratch]
+    add r11, rax
+    lea rdi, [rel sep_key]
+    mov rax, [r11+II_OBJ]
+    mov [rdi+IM_OBJ], rax
+    movzx eax, byte [r11+II_TYPE]
+    mov [rdi+IM_TYPE], al
+    mov rax, [r11+II_OFF]
+    mov [rdi+IM_OFF], rax
+    cmp qword [rsp], 0
+    je .newroot
+    mov rdi, [rsp]
+    dec rdi
+    mov rsi, [rel split_right]
+    lea r13, [rel sep_key]
+    call parent_insert
+    jmp .ret
+.newroot:
+    call alloc_tracked
+    test rax, rax
+    jz .nospc
+    mov rbx, rax
+    mov rdi, [rsp]
+    call path_ptr
+    mov r14, rax
+    lea rdi, [rel root_buf]
+    mov rsi, rbx
+    movzx edx, byte [r14+NH_LEVEL]
+    inc edx
+    call node_clear
+    lea r11, [rel root_buf]
+    lea rdi, [r11+PAYLOAD_OFF]
+    lea r11, [rel int_scratch]
+    mov rax, [r11+II_OBJ]
+    mov [rdi+II_OBJ], rax
+    movzx eax, byte [r11+II_TYPE]
+    mov [rdi+II_TYPE], al
+    mov rax, [r11+II_OFF]
+    mov [rdi+II_OFF], rax
+    mov rax, [rel path_bn]
+    mov [rdi+II_CHILD], rax
+    mov rax, [rel fs_generation]
+    mov [rdi+II_GEN], rax
+    lea r11, [rel root_buf]
+    lea rdi, [r11+PAYLOAD_OFF+INT_IH]
+    lea r11, [rel sep_key]
+    mov rax, [r11+IM_OBJ]
+    mov [rdi+II_OBJ], rax
+    movzx eax, byte [r11+IM_TYPE]
+    mov [rdi+II_TYPE], al
+    mov rax, [r11+IM_OFF]
+    mov [rdi+II_OFF], rax
+    mov rax, [rel split_right]
+    mov [rdi+II_CHILD], rax
+    mov rax, [rel fs_generation]
+    mov [rdi+II_GEN], rax
+    lea r11, [rel root_buf]
+    mov word [r11+NH_NITEMS], 2
+    lea rdi, [rel root_buf]
+    call node_write
+    test eax, eax
+    jnz .ret
+    mov [rel fs_root], rbx
+    xor eax, eax
+    jmp .ret
 .nospc:
     mov rax, -ENOSPC
+.ret:
+    EPILOGUE 24
+
+; rax = level of the current root, or -errno
+btree_root_level:
+    PROLOGUE 8
+    mov rdi, [rel fs_root]
+    lea rsi, [rel walk_buf]
+    call node_read
+    test eax, eax
+    jnz .ret
+    lea r11, [rel walk_buf]
+    movzx rax, byte [r11+NH_LEVEL]
+.ret:
+    EPILOGUE 8
+
+; rax = number of items in the root, or -errno
+btree_root_nitems:
+    PROLOGUE 8
+    mov rdi, [rel fs_root]
+    lea rsi, [rel walk_buf]
+    call node_read
+    test eax, eax
+    jnz .ret
+    lea r11, [rel walk_buf]
+    movzx rax, word [r11+NH_NITEMS]
+.ret:
     EPILOGUE 8
 
 ; rdi obj, rsi type, rdx off, rcx data, r8 len (len must match)

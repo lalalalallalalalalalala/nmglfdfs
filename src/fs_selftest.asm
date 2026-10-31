@@ -3,13 +3,22 @@
 extern fs_format, fs_open, fs_close, fs_sleep, fs_wake, fs_wipe
 extern fs_create, fs_mkdir, fs_lookup, fs_unlink, fs_rmdir
 extern fs_read, fs_write, fs_read_inode
+extern btree_get, btree_root_level, btree_root_nitems, crc32c
 extern pass_buf, pass_len, fs_stage, dbg_q, dbg_b, fs_root
-extern print_err, print_u64, memcmp, memset, memcpy
+extern print_err, print_out, print_u64, memcmp, memset, memcpy
 
 section .bss
 tbuf:       resb 8192
 rbuf:       resb 8192
 nameb:      resb 16
+ino_tab:    resq 4096
+n_bulk:     resq 1
+dir_ino:    resq 4
+dirf_ino:   resq 4
+exttmp:     resb 64
+tamper_bn:  resq 1
+root_bn:    resq 1
+which_fail: resb 1
 
 section .data
 img:        db "/tmp/nmgl-selftest.img", 0
@@ -32,6 +41,9 @@ step_wk:    db "fs wake", 10, 0
 step_wp:    db "fs wipe", 10, 0
 step_mkdir: db "fs mkdir", 10, 0
 step_plain: db "plaintext leaked", 10, 0
+step_split: db "fs internal split", 10, 0
+step_mac:   db "fs auth", 10, 0
+msg_nfiles: db "internal-split files ", 0
 fsok:       db "selftest: filesystem passed", 10, 0
 
 section .text
@@ -52,7 +64,7 @@ fs_selftest:
     syscall
 
     lea rdi, [rel img]
-    mov esi, 16
+    mov esi, 64
     call fs_format
     test rax, rax
     jz .open1
@@ -242,6 +254,16 @@ fs_selftest:
     lea rcx, [rel step_re]
     call .fail
 .plain:
+    call .grow_tree
+    test eax, eax
+    jz .plain2
+    lea rcx, [rel step_split]
+    cmp byte [rel which_fail], 2
+    jne .pfail
+    lea rcx, [rel step_mac]
+.pfail:
+    call .fail
+.plain2:
     call fs_close
     call .scan_plain
     test eax, eax
@@ -326,6 +348,455 @@ fs_selftest:
     call fs_close
     jmp .done
 
+; Grow the tree until the root is at least level 2, remount, read every
+; new object back, then reject a flipped ciphertext byte and a CRC-adjusted
+; metadata block. Returns 0, or -errno with which_fail set (1 split, 2 auth).
+.grow_tree:
+    PROLOGUE 24
+    mov byte [rel which_fail], 1
+    xor r13, r13
+.gtd:
+    cmp r13, 4
+    jae .gtfiles
+    lea rdi, [rel nameb]
+    mov byte [rdi], 'd'
+    mov eax, r13d
+    add al, '0'
+    mov [rel nameb+1], al
+    mov byte [rel nameb+2], 0
+    mov edi, ROOT_INO
+    lea rsi, [rel nameb]
+    mov edx, 2
+    mov ecx, 493
+    call fs_mkdir
+    cmp rax, 0
+    jle .gterr
+    lea r11, [rel dir_ino]
+    mov [r11+r13*8], rax
+    mov rdi, rax
+    lea rsi, [rel zname]
+    mov edx, 1
+    mov ecx, 420
+    call fs_create
+    cmp rax, 0
+    jle .gterr
+    lea r11, [rel dirf_ino]
+    mov [r11+r13*8], rax
+    mov rbx, rax
+    mov byte [rel nameb], 'Z'
+    mov eax, r13d
+    add al, '0'
+    mov [rel nameb+1], al
+    mov rdi, rbx
+    xor esi, esi
+    lea rdx, [rel nameb]
+    mov ecx, 2
+    call fs_write
+    cmp rax, 2
+    jne .gterr
+    inc r13
+    jmp .gtd
+.gtfiles:
+    xor r12, r12
+.gtloop:
+    cmp r12, 4096
+    jae .gtfull
+    mov eax, r12d
+    mov ecx, 1000
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+1], al
+    mov eax, edx
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+2], al
+    mov eax, edx
+    mov ecx, 10
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+3], al
+    add dl, '0'
+    mov [rel nameb+4], dl
+    mov byte [rel nameb], 'f'
+    mov byte [rel nameb+5], 0
+    mov edi, ROOT_INO
+    lea rsi, [rel nameb]
+    mov edx, 5
+    mov ecx, 420
+    call fs_create
+    cmp rax, 0
+    jle .gterr
+    lea r11, [rel ino_tab]
+    mov [r11+r12*8], rax
+    mov rbx, rax
+    mov rdi, rbx
+    xor esi, esi
+    lea rdx, [rel nameb+1]
+    mov ecx, 4
+    call fs_write
+    cmp rax, 4
+    jne .gterr
+    inc r12
+    call btree_root_level
+    cmp rax, 0
+    jl .gterr
+    cmp rax, 2
+    jl .gtloop
+    call btree_root_nitems
+    cmp rax, 0
+    jl .gterr
+    cmp rax, 3
+    jl .gtloop
+    mov [rel n_bulk], r12
+    mov [rsp], rax
+    lea rdi, [rel msg_nfiles]
+    call print_out
+    mov rax, [rel n_bulk]
+    call print_u64
+    mov edi, 1
+    lea rsi, [rel nl]
+    mov edx, 1
+    mov rax, SYS_write
+    syscall
+    jmp .gtreopen
+.gtfull:
+    mov rax, -ENOSPC
+    jmp .gterr
+.gtreopen:
+    call fs_close
+    lea rdi, [rel img]
+    call fs_open
+    test eax, eax
+    jnz .gterr
+    xor r12, r12
+.gtrd:
+    cmp r12, [rel n_bulk]
+    jae .gtdirs
+    mov eax, r12d
+    mov ecx, 1000
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+1], al
+    mov eax, edx
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+2], al
+    mov eax, edx
+    mov ecx, 10
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+3], al
+    add dl, '0'
+    mov [rel nameb+4], dl
+    lea r11, [rel ino_tab]
+    mov rdi, [r11+r12*8]
+    xor esi, esi
+    lea rdx, [rel rbuf]
+    mov ecx, 4
+    call fs_read
+    cmp rax, 4
+    jne .gterr
+    lea rdi, [rel rbuf]
+    lea rsi, [rel nameb+1]
+    mov edx, 4
+    call memcmp
+    test eax, eax
+    jnz .gterr
+    inc r12
+    jmp .gtrd
+.gtdirs:
+    xor r13, r13
+.gtdl:
+    cmp r13, 4
+    jae .gtname
+    mov byte [rel nameb], 'd'
+    mov eax, r13d
+    add al, '0'
+    mov [rel nameb+1], al
+    mov byte [rel nameb+2], 0
+    mov edi, ROOT_INO
+    lea rsi, [rel nameb]
+    mov edx, 2
+    call fs_lookup
+    lea r11, [rel dir_ino]
+    cmp rax, [r11+r13*8]
+    jne .gterr
+    lea r11, [rel dirf_ino]
+    mov rdi, [r11+r13*8]
+    xor esi, esi
+    lea rdx, [rel rbuf]
+    mov ecx, 2
+    call fs_read
+    cmp rax, 2
+    jne .gterr
+    mov byte [rel nameb], 'Z'
+    mov eax, r13d
+    add al, '0'
+    mov [rel nameb+1], al
+    lea rdi, [rel rbuf]
+    lea rsi, [rel nameb]
+    mov edx, 2
+    call memcmp
+    test eax, eax
+    jnz .gterr
+    inc r13
+    jmp .gtdl
+.gtname:
+    mov edi, ROOT_INO
+    lea rsi, [rel nameb]
+    mov byte [rel nameb], 'f'
+    mov eax, [rel n_bulk]
+    dec eax
+    mov ecx, 1000
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+1], al
+    mov eax, edx
+    mov ecx, 100
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+2], al
+    mov eax, edx
+    mov ecx, 10
+    xor edx, edx
+    div ecx
+    add al, '0'
+    mov [rel nameb+3], al
+    add dl, '0'
+    mov [rel nameb+4], dl
+    mov byte [rel nameb+5], 0
+    mov edi, ROOT_INO
+    lea rsi, [rel nameb]
+    mov edx, 5
+    call fs_lookup
+    cmp rax, 0
+    jle .gterr
+    lea r11, [rel ino_tab]
+    mov rcx, [rel n_bulk]
+    dec rcx
+    cmp rax, [r11+rcx*8]
+    jne .gterr
+    mov byte [rel which_fail], 2
+    lea r11, [rel ino_tab]
+    mov rdi, [r11]
+    mov rsi, TYPE_EXTENT
+    xor edx, edx
+    lea rcx, [rel exttmp]
+    mov r8, EXT_BYTES
+    call btree_get
+    cmp rax, EXT_BYTES
+    jne .gterr
+    lea r11, [rel exttmp]
+    mov rax, [r11+EXT_DISK]
+    mov [rel tamper_bn], rax
+    mov rax, [rel fs_root]
+    mov [rel root_bn], rax
+    call fs_close
+    mov rax, [rel tamper_bn]
+    shl rax, 12
+    add rax, 128
+    mov [rsp+8], rax
+    call .flip_at
+    test eax, eax
+    jnz .gterr
+    lea rdi, [rel img]
+    call fs_open
+    test eax, eax
+    jnz .gterr
+    lea r11, [rel ino_tab]
+    mov rdi, [r11]
+    xor esi, esi
+    lea rdx, [rel rbuf]
+    mov ecx, 4
+    call fs_read
+    mov [rsp], rax
+    call fs_close
+    mov rax, [rsp+8]
+    call .flip_at
+    test eax, eax
+    jnz .gterr
+    mov rax, [rsp]
+    cmp rax, -EIO
+    jne .gterr
+    lea rdi, [rel img]
+    call fs_open
+    test eax, eax
+    jnz .gterr
+    lea r11, [rel ino_tab]
+    mov rdi, [r11]
+    xor esi, esi
+    lea rdx, [rel rbuf]
+    mov ecx, 4
+    call fs_read
+    cmp rax, 4
+    jne .gterr
+    call fs_close
+    mov rax, [rel root_bn]
+    shl rax, 12
+    mov [rsp+8], rax
+    mov rax, SYS_open
+    lea rdi, [rel img]
+    mov rsi, O_RDWR
+    xor edx, edx
+    syscall
+    cmp rax, 0
+    jl .gterr
+    mov [rsp], rax
+    mov rax, SYS_pread
+    mov rdi, [rsp]
+    lea rsi, [rel tbuf]
+    mov edx, BLOCK_SIZE
+    mov r10, [rsp+8]
+    syscall
+    cmp rax, BLOCK_SIZE
+    jne .gtc
+    lea rdi, [rel rbuf]
+    lea rsi, [rel tbuf]
+    mov edx, BLOCK_SIZE
+    call memcpy
+    inc byte [rel tbuf+100]
+    mov dword [rel tbuf+NH_CRC], 0
+    lea rdi, [rel tbuf+8]
+    mov esi, BLOCK_SIZE-8
+    call crc32c
+    mov [rel tbuf+NH_CRC], eax
+    mov rax, SYS_pwrite
+    mov rdi, [rsp]
+    lea rsi, [rel tbuf]
+    mov edx, BLOCK_SIZE
+    mov r10, [rsp+8]
+    syscall
+    cmp rax, BLOCK_SIZE
+    jne .gtc
+    mov rax, SYS_close
+    mov rdi, [rsp]
+    syscall
+    lea rdi, [rel img]
+    call fs_open
+    cmp eax, -EIO
+    jne .gtmeta
+    mov rax, SYS_open
+    lea rdi, [rel img]
+    mov rsi, O_RDWR
+    xor edx, edx
+    syscall
+    cmp rax, 0
+    jl .gterr
+    mov [rsp], rax
+    mov rax, SYS_pwrite
+    mov rdi, [rsp]
+    lea rsi, [rel rbuf]
+    mov edx, BLOCK_SIZE
+    mov r10, [rsp+8]
+    syscall
+    cmp rax, BLOCK_SIZE
+    jne .gtc
+    mov rax, SYS_close
+    mov rdi, [rsp]
+    syscall
+    lea rdi, [rel img]
+    call fs_open
+    test eax, eax
+    jnz .gterr
+    xor eax, eax
+    jmp .gtdone
+.gtmeta:
+    mov [rsp+16], rax
+    mov rax, SYS_open
+    lea rdi, [rel img]
+    mov rsi, O_RDWR
+    xor edx, edx
+    syscall
+    cmp rax, 0
+    jl .gterr
+    mov rbx, rax
+    mov rax, SYS_pwrite
+    mov rdi, rbx
+    lea rsi, [rel rbuf]
+    mov edx, BLOCK_SIZE
+    mov r10, [rsp+8]
+    syscall
+    mov rax, SYS_close
+    mov rdi, rbx
+    syscall
+    mov rax, [rsp+16]
+    jmp .gterr
+.gtc:
+    mov rbx, rax
+    mov rax, SYS_close
+    mov rdi, [rsp]
+    syscall
+    mov rax, rbx
+    cmp rax, 0
+    jge .gtcio
+    jmp .gterr
+.gtcio:
+    mov rax, -EIO
+    jmp .gterr
+.gterr:
+    mov byte [rsp+16], 0
+    test rax, rax
+    js .gtdone
+    mov rax, -EIO
+.gtdone:
+    EPILOGUE 24
+
+; rax = file offset. XOR byte 1. Returns 0 or -errno.
+.flip_at:
+    PROLOGUE 8
+    mov [rsp], rax
+    mov rax, SYS_open
+    lea rdi, [rel img]
+    mov rsi, O_RDWR
+    xor edx, edx
+    syscall
+    cmp rax, 0
+    jl .flbad
+    mov rbx, rax
+    mov rax, SYS_pread
+    mov rdi, rbx
+    lea rsi, [rel nameb+8]
+    mov edx, 1
+    mov r10, [rsp]
+    syscall
+    cmp rax, 1
+    jne .flc
+    xor byte [rel nameb+8], 1
+    mov rax, SYS_pwrite
+    mov rdi, rbx
+    lea rsi, [rel nameb+8]
+    mov edx, 1
+    mov r10, [rsp]
+    syscall
+    cmp rax, 1
+    jne .flc
+    mov rax, SYS_close
+    mov rdi, rbx
+    syscall
+    xor eax, eax
+    EPILOGUE 8
+.flc:
+    mov r12, rax
+    mov rax, SYS_close
+    mov rdi, rbx
+    syscall
+    mov rax, r12
+    cmp rax, 0
+    jl .flbad
+    mov rax, -EIO
+.flbad:
+    EPILOGUE 8
+
 ; rcx = message. Increments r15 (not saved) and prints rax.
 .fail:
     push rbx
@@ -401,6 +872,7 @@ fs_selftest:
 
 section .data
 nl: db 10, 0
+zname: db "z", 0
 tag_root: db " root=", 0
 tag_q: db " q=", 0
 tag_b: db " b=", 0

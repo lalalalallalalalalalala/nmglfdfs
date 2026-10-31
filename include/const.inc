@@ -4,10 +4,12 @@ BLOCK_SIZE          equ 4096
 MAX_BITMAP_BLOCKS   equ 32
 MAX_NAME            equ 255
 MAX_PASS            equ 128
-KDF_ITERS_DEFAULT   equ 2048
+KDF_ITERS_DEFAULT   equ 200000
 MAX_TREE_DEPTH      equ 8
 PAYLOAD_OFF         equ 32
-PAYLOAD_SIZE        equ 4064
+PAYLOAD_SIZE        equ 4048
+MAC_OFF             equ 4080
+MAC_LEN             equ 16
 LEAF_IH             equ 32
 INT_IH              equ 40
 MAX_LEAF_ITEMS      equ 120
@@ -89,14 +91,15 @@ DIR_DTYPE           equ 8
 DIR_NAMELEN         equ 9
 DIR_NAME            equ 12
 
-; Extent item (32 bytes)
+; Extent item (48 bytes). MAC is HMAC-SHA256 truncated to 16 bytes.
 EXT_DISK            equ 0
 EXT_TIME            equ 8
 EXT_GEN             equ 16
 EXT_METHOD          equ 24
 EXT_PLEN            equ 26
 EXT_CRC             equ 28
-EXT_BYTES           equ 32
+EXT_MAC             equ 32
+EXT_BYTES           equ 48
 
 ROOT_INO            equ 256
 S_IFREG             equ 0x8000
