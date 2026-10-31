@@ -1,101 +1,107 @@
+> Languages: [English](README.md) · [Русский](README.ru.md) · [中文](README.zh.md)
+
 # NMGLFDFS
 
-**NMGLFDFS** (*No More Good Life For Decrypting File System*) — автономная шифрующая файловая система для Linux x86-64. Она не является патчем к Btrfs: это отдельный образ и отдельный код, но раскладка диска сознательно упрощённо повторяет идеи Btrfs (суперблок, B-дерево метаданных, copy-on-write, контрольные суммы).
+**NMGLFDFS** (*No More Good Life For Decrypting File System*) is a standalone encrypting filesystem for Linux x86-64. It is not a patch to Btrfs: it is a separate image and separate code, but its on-disk layout deliberately mirrors Btrfs ideas in simplified form (a superblock, a metadata B-tree, copy-on-write, checksums).
 
-Код написан на **NASM** (x86-64, системные вызовы Linux). Модуля ядра нет: монтирование идёт из пользовательского пространства по низкоуровневому протоколу `/dev/fuse`. Единственный внешний помощник — системная утилита `fusermount3`: она выполняет непривилегированный `mount(2)` и передаёт файловый дескриптор устройства. Сам протокол FUSE разбирает и отвечает на него код на NASM, без libfuse и без собственного C-кода.
+The code is written in **NASM** (x86-64, Linux syscalls). There is no kernel module: mounting happens from userspace over the low-level `/dev/fuse` protocol. The only external helper is the system utility `fusermount3`, which performs the unprivileged `mount(2)` and hands over the device file descriptor. The FUSE protocol itself is parsed and answered by the NASM code, with no libfuse and no C code of its own.
 
-## Сборка
+## Build
 
-Нужны `nasm`, `ld` и для монтирования — `fusermount3` (пакет `fuse3`) и доступ к `/dev/fuse`.
+You need `nasm`, `ld`, and for mounting `fusermount3` (the `fuse3` package) plus access to `/dev/fuse`.
 
 ```bash
 make
 make test
 ```
 
-`make` собирает:
+`make` builds:
 
-| Программа | Назначение |
+| Program | Purpose |
 | --- | --- |
-| `mkfs.nmglfdfs` | создать образ |
-| `nmglfdfs` | смонтировать образ |
+| `mkfs.nmglfdfs` | create an image |
+| `nmglfdfs` | mount an image |
 | `nmglfdfs-ctl` | `sleep`, `wake`, `wipe` |
-| `nmglfdfs-selftest` | криптографические и файловые самопроверки |
+| `nmglfdfs-selftest` | crypto and filesystem self-tests |
 
-## Использование
+## Usage
 
-Пароль задаётся переменной окружения `NMGLFDFS_PASSPHRASE` или флагом `-p`.
+The passphrase is supplied through the `NMGLFDFS_PASSPHRASE` environment variable or the `-p` flag.
 
 ```bash
-export NMGLFDFS_PASSPHRASE='секретная-фраза'
-./mkfs.nmglfdfs образ.img 64
+export NMGLFDFS_PASSPHRASE='secret-phrase'
+./mkfs.nmglfdfs image.img 64
 mkdir -p /mnt/nmgl
-./nmglfdfs образ.img /mnt/nmgl
-# в другом терминале:
-echo привет > /mnt/nmgl/файл.txt
+./nmglfdfs image.img /mnt/nmgl
+# in another terminal:
+echo hello > /mnt/nmgl/file.txt
 ls /mnt/nmgl
 fusermount3 -u /mnt/nmgl
 
-./nmglfdfs-ctl sleep образ.img    # метаданные скрыты, обычное монтирование откажется
-./nmglfdfs-ctl wake  образ.img    # вернуть тем же паролем
-./nmglfdfs-ctl wipe  образ.img    # необратимо уничтожить ключ
+./nmglfdfs-ctl sleep image.img    # metadata hidden, a normal mount will refuse
+./nmglfdfs-ctl wake  image.img    # restore with the same passphrase
+./nmglfdfs-ctl wipe  image.img    # irreversibly destroy the key
 ```
 
-`sleep` обратим: указатель на корень дерева и обёрнутый ключ запечатываются отдельным ключом, выведенным из пароля, а рабочие поля суперблока затираются. Пока флаг SLEEP установлен, `nmglfdfs` не открывает файлы — нужен явный `wake`.
+`sleep` is reversible: the pointer to the tree root and the wrapped key are sealed with a separate key derived from the passphrase, and the working fields of the superblock are cleared. While the SLEEP flag is set, `nmglfdfs` will not open files — an explicit `wake` is required.
 
-`wipe` необратим. Случайный ключ файловой системы хранится только в суперблоке, зашифрованный паролем. `wipe` затирает это поле, соль, проверочный код и узлы дерева метаданных. Даже зная пароль, восстановить ключ нельзя, и блоки данных остаются нечитаемым шифртекстом.
+`wipe` is irreversible. The random filesystem key is stored only in the superblock, encrypted with the passphrase. `wipe` clears that field, the salt, the verification code, and the metadata tree nodes. Even knowing the passphrase, the key cannot be recovered, and the data blocks remain unreadable ciphertext.
 
-## Как шифруется блок
+## How a block is encrypted
 
-На каждый блок файла (4096 байт) в момент записи берётся время в миллисекундах. Последняя цифра (`timestamp % 10`) выбирает один из десяти методов. Рядом в элементе extent, внутри зашифрованного листа B-дерева, сохраняются метка времени, номер поколения записи, индекс метода, CRC32C открытого текста и усечённый до 16 байт HMAC-SHA256 шифртекста. Тег считается от ключа данных и привязан к номеру блока, inode, смещению и полям extent. При чтении он проверяется до расшифрования: подмена байта даёт ошибку ввода-вывода. Без ключа метаданных сами эти поля не прочитать.
+For each 4096-byte file block, the time in milliseconds is read at the moment of writing. The last digit (`timestamp % 10`) selects one of ten methods. Alongside it, inside the encrypted B-tree leaf, the extent record stores the timestamp, the write generation number, the method index, the CRC32C of the plaintext, and an HMAC-SHA256 of the ciphertext truncated to 16 bytes. The tag is computed from the data key and bound to the block number, inode, offset, and extent fields. On read it is verified before decryption: a flipped byte yields an I/O error. Without the metadata key these fields themselves cannot be read.
 
-Порядок **шифрования**:
+The **encryption** order:
 
-1. **Переворот битов.** Из ключа данных, метки времени, поколения, смещения в файле и номера inode считается SHA-256, им запускается ChaCha20. Для каждого байта `i` берётся бит метки времени `(timestamp >> (i mod 64))` и чётность числа единичных битов метки. Если их XOR равен 1, байт инвертируется целиком (`NOT`), и всё это накладывается на гамму ChaCha20. Операция обратна самой себе и однозначно определяется сохранённой меткой времени.
-2. **Один из десяти обратимых слоёв** (см. ниже).
-3. **ChaCha20** с подключом SHA-256, в который входят номер метода, метка времени, поколение, смещение и inode. Счётчик блока — 1, чтобы гамма не совпала с шагом переворота битов.
+1. **Bit flip.** SHA-256 is computed over the data key, the timestamp, the generation, the in-file offset, and the inode number, and used to seed ChaCha20. For each byte `i`, the timestamp bit `(timestamp >> (i mod 64))` and the parity of the number of set bits in the timestamp are taken. If their XOR is 1, the whole byte is inverted (`NOT`), and all of this is laid over the ChaCha20 keystream. The operation is its own inverse and is uniquely determined by the stored timestamp.
+2. **One of ten reversible layers** (see below).
+3. **ChaCha20** with a SHA-256 subkey that includes the method number, timestamp, generation, offset, and inode. The block counter is 1, so the keystream does not coincide with the bit-flip step.
 
-Расшифрование идёт в обратном порядке. Индекс метода обязан совпадать с последней цифрой сохранённой метки времени.
+Decryption runs in reverse. The method index must match the last digit of the stored timestamp.
 
-Десять слоёв (все обратимы, затем или перед ними — ChaCha20):
+The ten layers (all reversible, with ChaCha20 after or before them):
 
-| Цифра | Слой |
+| Digit | Layer |
 | --- | --- |
-| 0 | умножение каждого `u64` на нечётную константу по модулю 2^64 |
-| 1 | сеть Фейстеля, 4 раунда, половины по 32 бита |
-| 2 | биективная перестановка битов внутри каждого `u64` |
-| 3 | умножение байта в поле GF(2^8) (многочлен AES) и XOR константы |
-| 4 | подстановка AES S-box |
-| 5 | ARX: сложение, циклический сдвиг, XOR |
-| 6 | обмен полубайтов, сложение по модулю 256, XOR с индексом |
-| 7 | аффинное преобразование AES над GF(2) |
-| 8 | сеть Фейстеля на 16 байт, половины по 64 бита |
-| 9 | MixColumns AES на каждой четвёрке байтов |
+| 0 | multiply each `u64` by an odd constant modulo 2^64 |
+| 1 | Feistel network, 4 rounds, 32-bit halves |
+| 2 | bijective bit permutation within each `u64` |
+| 3 | byte multiplication in GF(2^8) (the AES polynomial) and XOR with a constant |
+| 4 | AES S-box substitution |
+| 5 | ARX: add, rotate, XOR |
+| 6 | nibble swap, add modulo 256, XOR with the index |
+| 7 | AES affine transform over GF(2) |
+| 8 | Feistel network over 16 bytes, 64-bit halves |
+| 9 | AES MixColumns on each group of four bytes |
 
-Ключ данных и ключ метаданных выводятся из случайного 32-байтового ключа файловой системы. Он создаётся при `mkfs` (`getrandom`) и хранится в суперблоке, зашифрованный ChaCha20. Ключ шифрования этого поля получается через PBKDF2-HMAC-SHA256 (200000 итераций, соль в суперблоке). Число итераций записано в суперблоке, поэтому уже созданный образ открывается со своим счётчиком.
+The data key and the metadata key are derived from a random 32-byte filesystem key. It is created at `mkfs` (`getrandom`) and stored in the superblock, encrypted with ChaCha20. The key that encrypts this field comes from PBKDF2-HMAC-SHA256 (200000 iterations, salt in the superblock). The iteration count is written in the superblock, so an already-created image opens with its own count.
 
-Подробная раскладка диска — в [docs/FORMAT.md](docs/FORMAT.md).
+The full on-disk layout is in [docs/FORMAT.md](docs/FORMAT.md).
 
-## Честно о стойкости
+## Honest note on security
 
-Стойкость задумана на **ChaCha20** и на том, что ключ файловой системы случайный и уничтожается при `wipe`. Математические слои добавляют рассеивание, как просил автор схемы, но **не заменяют проверенную криптографию**. Это учебный прототип:
+Security is meant to rest on **ChaCha20** and on the filesystem key being random and destroyed by `wipe`. The mathematical layers add diffusion, as the scheme's author asked, but they **do not replace vetted cryptography**. This is a learning prototype:
 
-- реализация ChaCha20, SHA-256, HMAC и PBKDF2 написана здесь же, на NASM, и **не аудирована**;
-- режим (переворот битов + «цифра миллисекунды» + свой подключ) **не является** стандартным ChaCha20-Poly1305: аутентификация — отдельный HMAC-SHA256, усечённый до 16 байт, а не Poly1305;
-- 200000 итераций PBKDF2-HMAC-SHA256 — обычный современный минимум, но слабый пароль всё равно лучше не использовать;
-- нет защиты от отката всего образа на старую копию: тег ловит подмену байтов, но не замену файла целиком на прежнюю версию;
-- `sleep` прячет ключ от обычного монтирования, но запечатанный блоб остаётся на диске и вскрывается тем же паролем через `wake`.
+- the ChaCha20, SHA-256, HMAC, and PBKDF2 implementations are written here in NASM and are **not audited**;
+- the mode (bit flip + "millisecond digit" + a custom subkey) is **not** standard ChaCha20-Poly1305: authentication is a separate HMAC-SHA256 truncated to 16 bytes, not Poly1305;
+- 200000 PBKDF2-HMAC-SHA256 iterations are a normal modern minimum, but a weak passphrase is still best avoided;
+- there is no protection against rolling the whole image back to an older copy: the tag catches byte tampering, but not replacing a file wholesale with a previous version;
+- `sleep` hides the key from a normal mount, but the sealed blob stays on disk and is reopened with the same passphrase via `wake`.
 
-Не храните в этом прототипе данные, которые жалко потерять или показать.
+Do not keep data in this prototype that you would hate to lose or expose.
 
-## Ограничения прототипа
+## Prototype limitations
 
-- Нет снимков, жёстких ссылок, символических ссылок, расширенных атрибутов и разреженных файлов как отдельной структуры (дыра читается нулями, пока в неё не записали).
-- Свободное место — битовая карта, а не дерево экстентов Btrfs. Суперблок пишется на место (две копии: блок 0 и блок 1). Устойчивость к сбою питания — по возможности: новые узлы пишутся до смены указателя корня, но это не полноценный журнал.
-- Внутренний узел вмещает до 101 потомка. Полный узел делится пополам, а если это корень — дерево вырастает на уровень. «Нет места» остаётся ответом, когда кончились блоки образа или глубина достигла восьми.
-- Один поток обработки запросов FUSE. Каталоги на тысячи файлов будут читаться полным обходом дерева.
-- Размер образа при создании — от 4 до 2048 МиБ.
+- No snapshots, hard links, symbolic links, extended attributes, or sparse files as a separate structure (a hole reads as zeros until written into).
+- Free space is a bitmap, not a Btrfs extent tree. The superblock is written in place (two copies: block 0 and block 1). Crash resilience is best-effort: new nodes are written before the root pointer moves, but this is not a full journal.
+- An internal node holds up to 101 children. A full node splits in half, and if it is the root the tree grows a level. "No space" remains the answer when the image runs out of blocks or the depth reaches eight.
+- A single FUSE request-handling thread. Directories with thousands of files are read by a full tree walk.
+- Image size at creation is from 4 to 2048 MiB.
 
-## Тесты
+## Tests
 
-`make test` запускает `tests/run_tests.sh`: самопроверку (все 10 методов, детерминизм переворота битов, известные ответы SHA-256 / ChaCha20 / CRC32C / PBKDF2, запись и чтение, повторное открытие, рост B-дерева на новый уровень и деление некорневого внутреннего узла, повторное чтение, отказ чтения после подмены байта шифртекста и после подмены узла с пересчитанным CRC, `sleep`/`wake`/`wipe`) и, если есть `/dev/fuse`, сквозной сценарий монтирования.
+`make test` runs `tests/run_tests.sh`: the self-test (all 10 methods, bit-flip determinism, known-answer tests for SHA-256 / ChaCha20 / CRC32C / PBKDF2, write and read, reopen, B-tree growth to a new level and splitting of a non-root internal node, re-reading, read failure after flipping a ciphertext byte and after tampering with a node and recomputing its CRC, `sleep`/`wake`/`wipe`) and, if `/dev/fuse` is present, an end-to-end mount scenario.
+
+## License
+
+See [LICENSE](LICENSE). In short: do what you want with the source, including modifying it, but you take all responsibility and risk yourself; **not recommended for everyday use** and **not recommended for commercial use**; provided with no warranty.
