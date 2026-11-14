@@ -427,6 +427,8 @@ cli_init:
     jz .noenv
     mov rdi, rax
     call .copy_pass
+    test eax, eax
+    jnz .bad
 .noenv:
     mov rbx, 1
 .loop:
@@ -443,6 +445,8 @@ cli_init:
     jae .bad
     mov rdi, [r12+rbx*8]
     call .copy_pass
+    test eax, eax
+    jnz .bad
     inc rbx
     jmp .loop
 .notp:
@@ -455,6 +459,8 @@ cli_init:
     jnz .pos
     lea rdi, [rdi+13]
     call .copy_pass
+    test eax, eax
+    jnz .bad
     inc rbx
     jmp .loop
 .pos:
@@ -482,10 +488,8 @@ cli_init:
     push rbx
     mov rbx, rdi
     call strlen
-    cmp rax, MAX_PASS-1
-    jb .oklen
-    mov rax, MAX_PASS-1
-.oklen:
+    cmp rax, MAX_PASS
+    jae .toolong
     mov [rel pass_len], rax
     lea rdi, [rel pass_buf]
     mov rsi, rbx
@@ -494,7 +498,12 @@ cli_init:
     mov rcx, [rel pass_len]
     lea rdi, [rel pass_buf]
     mov byte [rdi+rcx], 0
+    xor eax, eax
     pop rbx
+    ret
+.toolong:
+    pop rbx
+    mov rax, -EINVAL
     ret
 
 app_startup:

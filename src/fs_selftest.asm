@@ -2,9 +2,9 @@
 
 extern fs_format, fs_open, fs_close, fs_sleep, fs_wake, fs_wipe
 extern fs_create, fs_mkdir, fs_lookup, fs_unlink, fs_rmdir
-extern fs_read, fs_write, fs_read_inode
+extern fs_read, fs_write, fs_truncate, fs_rename, fs_read_inode
 extern btree_get, btree_root_level, btree_root_nitems, crc32c
-extern pass_buf, pass_len, fs_stage, dbg_q, dbg_b, fs_root
+extern pass_buf, pass_len, fs_stage, dbg_q, dbg_b, fs_root, fs_free
 extern print_err, print_out, print_u64, memcmp, memset, memcpy
 
 section .bss
@@ -43,6 +43,13 @@ step_mkdir: db "fs mkdir", 10, 0
 step_plain: db "plaintext leaked", 10, 0
 step_split: db "fs internal split", 10, 0
 step_mac:   db "fs auth", 10, 0
+step_reclaim: db "fs reclaim", 10, 0
+step_ren:   db "fs rename", 10, 0
+fn_wide:    db "wide", 0
+fn_r1:      db "r1", 0
+fn_r2:      db "r2", 0
+fn_pd:      db "pd", 0
+fn_ch:      db "ch", 0
 msg_nfiles: db "internal-split files ", 0
 fsok:       db "selftest: filesystem passed", 10, 0
 
@@ -254,6 +261,18 @@ fs_selftest:
     lea rcx, [rel step_re]
     call .fail
 .plain:
+    call .extent_reclaim
+    test eax, eax
+    jz .rencase
+    lea rcx, [rel step_reclaim]
+    call .fail
+.rencase:
+    call .rename_cases
+    test eax, eax
+    jz .grown
+    lea rcx, [rel step_ren]
+    call .fail
+.grown:
     call .grow_tree
     test eax, eax
     jz .plain2
@@ -795,6 +814,235 @@ fs_selftest:
     jl .flbad
     mov rax, -EIO
 .flbad:
+    EPILOGUE 8
+
+; File larger than the 256-extent collector: every extent must disappear
+; on truncate-to-zero and on unlink. rax = 0 or -errno.
+.extent_reclaim:
+    PROLOGUE 24
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_wide]
+    mov edx, 4
+    mov ecx, 420
+    call fs_create
+    cmp rax, 0
+    jle .erbad
+    mov [rsp], rax
+    xor r12, r12
+.erw:
+    cmp r12, 260
+    jae .ertr
+    lea rdi, [rel tbuf]
+    mov esi, 'Q'
+    mov edx, 4096
+    call memset
+    mov rdi, [rsp]
+    mov rax, r12
+    shl rax, 12
+    mov rsi, rax
+    lea rdx, [rel tbuf]
+    mov ecx, 4096
+    call fs_write
+    cmp rax, 4096
+    jne .erbad
+    inc r12
+    jmp .erw
+.ertr:
+    mov rdi, [rsp]
+    mov rsi, 100
+    call fs_truncate
+    test eax, eax
+    jnz .erbad
+    mov rdi, [rsp]
+    xor esi, esi
+    lea rdx, [rel rbuf]
+    mov ecx, 200
+    call fs_read
+    cmp rax, 100
+    jne .erbad
+    cmp byte [rel rbuf], 'Q'
+    jne .erbad
+    cmp byte [rel rbuf+99], 'Q'
+    jne .erbad
+    mov rdi, [rsp]
+    mov rsi, 4096
+    lea rdx, [rel rbuf]
+    mov ecx, 16
+    call fs_read
+    test rax, rax
+    jnz .erbad
+    mov rdi, [rsp]
+    mov rsi, TYPE_EXTENT
+    mov rdx, 256
+    shl rdx, 12
+    lea rcx, [rel exttmp]
+    mov r8, EXT_BYTES
+    call btree_get
+    cmp rax, -ENOENT
+    jne .erbad
+    mov rdi, [rsp]
+    xor esi, esi
+    call fs_truncate
+    test eax, eax
+    jnz .erbad
+    mov rdi, [rsp]
+    mov rsi, TYPE_EXTENT
+    xor edx, edx
+    lea rcx, [rel exttmp]
+    mov r8, EXT_BYTES
+    call btree_get
+    cmp rax, -ENOENT
+    jne .erbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_wide]
+    mov edx, 4
+    call fs_unlink
+    test eax, eax
+    jnz .erbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_wide]
+    mov edx, 4
+    call fs_lookup
+    cmp rax, -ENOENT
+    jne .erbad
+    xor eax, eax
+    EPILOGUE 24
+.erbad:
+    test rax, rax
+    js .erdone
+    mov rax, -EIO
+.erdone:
+    EPILOGUE 24
+
+; Same-name rename is a no-op; moving a directory into its descendant is EINVAL.
+.rename_cases:
+    PROLOGUE 8
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_r1]
+    mov edx, 2
+    mov ecx, 420
+    call fs_create
+    cmp rax, 0
+    jle .rnbad
+    mov rbx, rax
+    mov rdi, rbx
+    xor esi, esi
+    lea rdx, [rel fn_r1]
+    mov ecx, 2
+    call fs_write
+    cmp rax, 2
+    jne .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_pd]
+    mov edx, 2
+    mov ecx, 493
+    call fs_mkdir
+    cmp rax, 0
+    jle .rnbad
+    mov r12, rax
+    mov rdi, r12
+    lea rsi, [rel fn_ch]
+    mov edx, 2
+    mov ecx, 493
+    call fs_mkdir
+    cmp rax, 0
+    jle .rnbad
+    mov r13, rax
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_pd]
+    mov edx, 2
+    mov rcx, r13
+    lea r8, [rel fn_pd]
+    mov r9d, 2
+    call fs_rename
+    cmp rax, -EINVAL
+    jne .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_r1]
+    mov edx, 2
+    mov ecx, ROOT_INO
+    lea r8, [rel fn_r1]
+    mov r9d, 2
+    call fs_rename
+    test eax, eax
+    jnz .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_r1]
+    mov edx, 2
+    mov ecx, ROOT_INO
+    lea r8, [rel fn_r2]
+    mov r9d, 2
+    call fs_rename
+    test eax, eax
+    jnz .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_r1]
+    mov edx, 2
+    call fs_lookup
+    cmp rax, -ENOENT
+    jne .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_r2]
+    mov edx, 2
+    call fs_lookup
+    cmp rax, rbx
+    jne .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_pd]
+    mov edx, 2
+    call fs_lookup
+    cmp rax, r12
+    jne .rnbad
+    mov rdi, r13
+    lea rsi, [rel fn_pd]
+    mov edx, 2
+    call fs_lookup
+    cmp rax, -ENOENT
+    jne .rnbad
+    mov rdi, r12
+    lea rsi, [rel fn_ch]
+    mov edx, 2
+    mov ecx, ROOT_INO
+    lea r8, [rel fn_ch]
+    mov r9d, 2
+    call fs_rename
+    test eax, eax
+    jnz .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_ch]
+    mov edx, 2
+    call fs_lookup
+    cmp rax, r13
+    jne .rnbad
+    mov edi, ROOT_INO
+    lea rsi, [rel fn_r2]
+    mov edx, 2
+    mov rcx, r12
+    lea r8, [rel fn_r2]
+    mov r9d, 2
+    call fs_rename
+    test eax, eax
+    jnz .rnbad
+    mov rdi, r12
+    lea rsi, [rel fn_r2]
+    mov edx, 2
+    call fs_lookup
+    cmp rax, rbx
+    jne .rnbad
+    mov rdi, rbx
+    xor esi, esi
+    lea rdx, [rel rbuf]
+    mov ecx, 2
+    call fs_read
+    cmp rax, 2
+    jne .rnbad
+    xor eax, eax
+    EPILOGUE 8
+.rnbad:
+    test rax, rax
+    js .rndone
+    mov rax, -EIO
+.rndone:
     EPILOGUE 8
 
 ; rcx = message. Increments r15 (not saved) and prints rax.
