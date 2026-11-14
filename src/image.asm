@@ -278,8 +278,18 @@ node_read:
     test eax, eax
     jnz .badmac
     movzx eax, word [r12+NH_NITEMS]
+    movzx ecx, byte [r12+NH_LEVEL]
+    cmp ecx, MAX_TREE_DEPTH
+    jae .badn
+    test ecx, ecx
+    jnz .intn
     cmp ax, MAX_LEAF_ITEMS
     ja .badn
+    jmp .havel
+.intn:
+    cmp ax, MAX_INT_ITEMS
+    ja .badn
+.havel:
     lea r14, [rel nonce_tmp]
     mov rax, [r12+NH_BYTENR]
     mov [r14], rax
@@ -292,6 +302,39 @@ node_read:
     mov r8, r14
     xor r9d, r9d
     call chacha20_xor
+    cmp byte [r12+NH_LEVEL], 0
+    jne .okv
+    movzx r13, word [r12+NH_NITEMS]
+    xor r14, r14
+    xor r15, r15
+.vl:
+    cmp r15, r13
+    jae .okv
+    mov rax, r15
+    shl rax, 5
+    lea r11, [r12+PAYLOAD_OFF]
+    add r11, rax
+    mov eax, [r11+IH_DOFF]
+    mov ecx, [r11+IH_DLEN]
+    mov rdx, r13
+    shl rdx, 5
+    cmp rax, rdx
+    jb .badn
+    cmp rax, PAYLOAD_SIZE
+    ja .badn
+    cmp rcx, PAYLOAD_SIZE
+    ja .badn
+    add eax, ecx
+    jc .badn
+    cmp eax, PAYLOAD_SIZE
+    ja .badn
+    add r14, rcx
+    jc .badn
+    cmp r14, PAYLOAD_SIZE
+    ja .badn
+    inc r15
+    jmp .vl
+.okv:
     xor eax, eax
     jmp .ret
 .badmagic:
@@ -762,6 +805,45 @@ build_root_inode:
     call node_write
     EPILOGUE 8
 
+; Reject a superblock whose geometry can walk off bitmap_mem.
+super_sane:
+    mov eax, [rel super_buf+SB_BLOCK_SIZE]
+    cmp eax, BLOCK_SIZE
+    jne .bad
+    mov eax, [rel fs_bitmap_blocks]
+    test eax, eax
+    jz .bad
+    cmp eax, MAX_BITMAP_BLOCKS
+    ja .bad
+    mov rax, [rel fs_total]
+    cmp rax, 1024
+    jb .bad
+    mov rcx, 2048
+    shl rcx, 8
+    cmp rax, rcx
+    ja .bad
+    mov ecx, [rel fs_bitmap_blocks]
+    shl rcx, 15
+    cmp rcx, rax
+    jb .bad
+    mov rax, [rel fs_bitmap_start]
+    cmp rax, 2
+    jne .bad
+    mov eax, [rel fs_flags]
+    test eax, FLAG_SLEEP | FLAG_WIPED
+    jnz .ok
+    mov rax, [rel fs_root]
+    test rax, rax
+    jz .bad
+    cmp rax, [rel fs_total]
+    jae .bad
+.ok:
+    xor eax, eax
+    ret
+.bad:
+    mov rax, -EIO
+    ret
+
 ; rdi = path. Full open for read/write of files.
 fs_open:
     PROLOGUE 8
@@ -840,6 +922,14 @@ open_super:
     jnz .ret
 .un:
     call super_unpack
+    call super_sane
+    test eax, eax
+    jz .opened
+    mov [rsp], eax
+    call fs_close
+    mov eax, [rsp]
+    jmp .ret
+.opened:
     xor eax, eax
     jmp .ret
 .syse:
@@ -880,6 +970,8 @@ fs_sleep:
     test eax, FLAG_WIPED
     jnz .wiped
     call kdf_kek
+    test eax, eax
+    jnz .done
     call check_verifier
     test eax, eax
     jnz .done
@@ -945,6 +1037,8 @@ fs_wake:
     test eax, FLAG_WIPED
     jnz .wiped
     call kdf_kek
+    test eax, eax
+    jnz .done
     call check_verifier
     test eax, eax
     jnz .done

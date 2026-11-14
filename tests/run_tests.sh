@@ -8,6 +8,21 @@ make -s
 echo "== самопроверка =="
 ./nmglfdfs-selftest
 
+echo "== длинный пароль =="
+LONGPW=$(awk 'BEGIN { for (i = 0; i < 128; i++) printf "a" }')
+if ./mkfs.nmglfdfs -p "$LONGPW" /tmp/nmgl-long-pw.img 4 >/tmp/nmgl-long-pw.log 2>&1; then
+    echo "пароль длиннее 127 байт принят"
+    exit 1
+fi
+rm -f /tmp/nmgl-long-pw.img /tmp/nmgl-long-pw.log
+LONGOK=$(awk 'BEGIN { for (i = 0; i < 127; i++) printf "b" }')
+if ! ./mkfs.nmglfdfs -p "$LONGOK" /tmp/nmgl-long-ok.img 4 >/tmp/nmgl-long-ok.log 2>&1; then
+    echo "пароль из 127 байт отклонён"
+    cat /tmp/nmgl-long-ok.log || true
+    exit 1
+fi
+rm -f /tmp/nmgl-long-ok.img /tmp/nmgl-long-ok.log
+
 if [ ! -e /dev/fuse ] || ! command -v fusermount3 >/dev/null 2>&1; then
     echo "FUSE недоступен, сквозной тест монтирования пропущен."
     exit 0

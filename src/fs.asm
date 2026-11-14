@@ -3,6 +3,7 @@
 extern memcpy, memset, memcmp, ct_memeq, crc32c, now_ms, pipeline_apply, strlen
 extern hmac_init, hmac_update, hmac_final
 extern block_read, block_write, alloc_block, free_block, bitmap_write, super_store
+extern node_read, fs_total
 extern btree_get, btree_insert, btree_update, btree_delete, tree_walk
 extern fs_prepare_admin, fs_close, fill_random
 extern fs_next_inode, fs_write_seq, fs_op_uid, fs_op_gid, fs_data_key
@@ -31,6 +32,7 @@ scan_dtype:     resb 1
 ext_off:        resq 256
 ext_disk:       resq 256
 ext_n:          resq 1
+ext_min:        resq 1
 meta_bn:        resq 2048
 meta_n:         resq 1
 new_extents:    resq 1
@@ -333,7 +335,7 @@ create_common:
     mov rdx, [rsp+16]
     call alloc_dir_off
     cmp rax, -4096
-    ja .ret
+    ja .orphan
     mov r12, rax
     lea rdi, [rel dir_buf]
     xor esi, esi
@@ -360,7 +362,7 @@ create_common:
     add r8, DIR_NAME
     call btree_insert
     test eax, eax
-    jnz .ret
+    jnz .orphan
     cmp qword [rsp+32], DT_DIR
     jne .done
     mov rdi, [rsp]
@@ -378,6 +380,14 @@ create_common:
     jmp .ret
 .exist:
     mov rax, -EEXIST
+    jmp .ret
+.orphan:
+    mov r15, rax
+    mov rdi, rbx
+    mov rsi, TYPE_INODE
+    xor edx, edx
+    call btree_delete
+    mov rax, r15
     jmp .ret
 .notdir:
     mov rax, -ENOTDIR
@@ -424,10 +434,12 @@ ext_on_node:
     mov rax, [r14+IH_OBJ]
     cmp rax, [rel scan_dir]
     jne .n
+    mov rax, [r14+IH_OFF]
+    cmp rax, [rel ext_min]
+    jb .n
     mov rcx, [rel ext_n]
     cmp rcx, 256
     jae .d
-    mov rax, [r14+IH_OFF]
     lea r11, [rel ext_off]
     mov [r11+rcx*8], rax
     mov eax, [r14+IH_DOFF]
@@ -475,17 +487,18 @@ fs_unlink:
     and eax, 0xf000
     cmp eax, S_IFDIR
     je .isdir
+    mov qword [rel ext_min], 0
+.ubatch:
     mov rdi, r14
     call collect_extents
     test eax, eax
     jnz .ret
+    cmp qword [rel ext_n], 0
+    je .di
     xor r15, r15
 .fe:
     cmp r15, [rel ext_n]
-    jae .di
-    lea r11, [rel ext_disk]
-    mov rdi, [r11+r15*8]
-    call free_block
+    jae .uflush
     mov rdi, r14
     mov rsi, TYPE_EXTENT
     lea r11, [rel ext_off]
@@ -493,8 +506,28 @@ fs_unlink:
     call btree_delete
     test eax, eax
     jnz .ret
+    lea r11, [rel ext_disk]
+    mov rdi, [r11+r15*8]
+    call free_block
     inc r15
     jmp .fe
+.uflush:
+    call bitmap_write
+    test eax, eax
+    jnz .ret
+    call super_store
+    test eax, eax
+    jnz .ret
+    cmp qword [rel ext_n], 256
+    jb .di
+    lea r11, [rel ext_off]
+    mov rcx, [rel ext_n]
+    dec rcx
+    mov rax, [r11+rcx*8]
+    add rax, 1
+    jc .di
+    mov [rel ext_min], rax
+    jmp .ubatch
 .di:
     mov rdi, r14
     mov rsi, TYPE_INODE
@@ -511,7 +544,10 @@ fs_unlink:
     xor esi, esi
     call tree_walk
     cmp byte [rel scan_found], 0
-    je .ok
+    jne .udel
+    mov rax, -EIO
+    jmp .ret
+.udel:
     mov rdi, rbx
     mov rsi, TYPE_DIR
     mov rdx, [rel scan_off]
@@ -519,9 +555,6 @@ fs_unlink:
     jmp .ret
 .isdir:
     mov rax, -EISDIR
-    jmp .ret
-.ok:
-    xor eax, eax
 .ret:
     EPILOGUE 8
 
@@ -572,7 +605,10 @@ fs_rmdir:
     xor esi, esi
     call tree_walk
     cmp byte [rel scan_found], 0
-    je .pn
+    jne .pdel
+    mov rax, -EIO
+    jmp .ret
+.pdel:
     mov rdi, rbx
     mov rsi, TYPE_DIR
     mov rdx, [rel scan_off]
@@ -871,6 +907,9 @@ fs_write:
     mov qword [rsp+32], 0
     cmp rcx, 0
     je .zero
+    mov rax, rsi
+    add rax, rcx
+    jc .inval
     mov rdi, [rsp]
     call load_ino
     mov [rel dbg_b], rax
@@ -1097,11 +1136,12 @@ fs_write:
 .zero:
     xor eax, eax
     jmp .ret
+.inval:
+    mov rax, -EINVAL
+    jmp .ret
 .aserr:
 .ret:
     EPILOGUE 40
-
-; The `mov rdi, plain_blk` above is missing rel. Fixed below if assemble fails.
 
 fs_truncate:
     PROLOGUE 24
@@ -1116,38 +1156,29 @@ fs_truncate:
     cmp rax, [rsp+8]
     je .ok
     jb .grow
-    mov rdi, [rsp]
-    call collect_extents
-    test eax, eax
-    jnz .ret
     mov rax, [rsp+8]
     and rax, ~4095
     mov r12, rax               ; partial block, or the cut if aligned
     mov rax, [rsp+8]
     and rax, 4095
     mov r13, rax               ; inner, 0 if aligned
+    mov rax, r12
+    test r13, r13
+    jz .min0
+    add rax, 4096              ; keep the partial block, drop the rest
+.min0:
+    mov [rel ext_min], rax
+.tbatch:
+    mov rdi, [rsp]
+    call collect_extents
+    test eax, eax
+    jnz .ret
+    cmp qword [rel ext_n], 0
+    je .tail
     xor r14, r14
 .l:
     cmp r14, [rel ext_n]
-    jae .tail
-    lea r11, [rel ext_off]
-    mov rax, [r11+r14*8]
-    cmp r13, 0
-    jne .part
-    cmp rax, [rsp+8]
-    jb .keep
-    jmp .drop
-.part:
-    cmp rax, r12
-    jb .keep
-    cmp rax, r12
-    jne .drop
-    ; rewrite this block with the tail zeroed — handled after the loop
-    jmp .keep
-.drop:
-    lea r11, [rel ext_disk]
-    mov rdi, [r11+r14*8]
-    call free_block
+    jae .tflush
     mov rdi, [rsp]
     mov rsi, TYPE_EXTENT
     lea r11, [rel ext_off]
@@ -1155,11 +1186,30 @@ fs_truncate:
     call btree_delete
     test eax, eax
     jnz .ret
+    lea r11, [rel ext_disk]
+    mov rdi, [r11+r14*8]
+    call free_block
     lea r11, [rel ino_buf]
     dec qword [r11+INO_BLOCKS]
-.keep:
     inc r14
     jmp .l
+.tflush:
+    call bitmap_write
+    test eax, eax
+    jnz .ret
+    call super_store
+    test eax, eax
+    jnz .ret
+    cmp qword [rel ext_n], 256
+    jb .tail
+    lea r11, [rel ext_off]
+    mov rcx, [rel ext_n]
+    dec rcx
+    mov rax, [r11+rcx*8]
+    add rax, 1
+    jc .tail
+    mov [rel ext_min], rax
+    jmp .tbatch
 .tail:
     test r13, r13
     jz .setsz
@@ -1280,16 +1330,19 @@ fs_truncate:
     mov rax, [rsp+8]
     lea r11, [rel ino_buf]
     mov [r11+INO_SIZE], rax
+    call now_ms
+    xor edx, edx
+    mov rcx, 1000
+    div rcx
+    lea r11, [rel ino_buf]
+    mov [r11+INO_MTIME], rax
+    lea r11, [rel ino_buf]
+    mov [r11+INO_CTIME], rax
     mov rdi, [rsp]
     call save_ino
     jmp .ret
 .grow:
-    mov rax, [rsp+8]
-    lea r11, [rel ino_buf]
-    mov [r11+INO_SIZE], rax
-    mov rdi, [rsp]
-    call save_ino
-    jmp .ret
+    jmp .setsz
 .nospc:
     mov rax, -ENOSPC
     jmp .ret
@@ -1298,16 +1351,24 @@ fs_truncate:
 .ret:
     EPILOGUE 24
 
-; Minimal rename: same-directory or cross-directory, no replace of non-empty dirs.
+; Rename without replacing an existing name.
 ; rdi olddir, rsi oldname, rdx oldlen, rcx newdir, r8 newname, r9 newlen
 fs_rename:
-    PROLOGUE 40
+    PROLOGUE 56
     mov [rsp], rdi
     mov [rsp+8], rsi
     mov [rsp+16], rdx
     mov [rsp+24], rcx
     mov [rsp+32], r8
-    mov r15, r9
+    mov [rsp+40], r9
+    cmp rdx, 0
+    je .inval
+    cmp rdx, MAX_NAME
+    ja .long
+    cmp r9, 0
+    je .inval
+    cmp r9, MAX_NAME
+    ja .long
     mov rdi, [rsp]
     mov rsi, [rsp+8]
     mov rdx, [rsp+16]
@@ -1317,22 +1378,50 @@ fs_rename:
     mov rbx, rax
     mov rdi, [rsp+24]
     mov rsi, [rsp+32]
-    mov rdx, r15
+    mov rdx, [rsp+40]
     call fs_lookup
     cmp rax, 0
-    jge .exist
+    jl .miss
+    cmp rax, rbx
+    je .ok
+    mov rax, -EEXIST
+    jmp .ret
+.miss:
     cmp eax, -ENOENT
-    jne .aserr
+    jne .ret
     mov rdi, rbx
     call load_ino
     test eax, eax
     jnz .ret
     lea r11, [rel ino_buf]
     mov eax, [r11+INO_MODE]
-    mov [rsp+16], eax          ; reuse, oldlen no longer needed after lookup
+    mov [rsp+48], eax
+    and eax, 0xf000
+    cmp eax, S_IFDIR
+    jne .nocycle
+    mov r13, [rsp+24]
+    xor r14, r14
+.anc:
+    cmp r13, rbx
+    je .inval
+    cmp r13, ROOT_INO
+    je .nocycle
+    test r13, r13
+    jz .inval
+    inc r14
+    cmp r14, 64
+    ja .io
+    mov rdi, r13
+    call load_ino
+    test eax, eax
+    jnz .ret
+    lea r11, [rel ino_buf]
+    mov r13, [r11+INO_PARENT]
+    jmp .anc
+.nocycle:
     mov rdi, [rsp+24]
     mov rsi, [rsp+32]
-    mov rdx, r15
+    mov rdx, [rsp+40]
     call alloc_dir_off
     cmp rax, -4096
     ja .ret
@@ -1343,7 +1432,7 @@ fs_rename:
     call memset
     lea r11, [rel dir_buf]
     mov [r11+DIR_INO], rbx
-    mov eax, [rsp+16]
+    mov eax, [rsp+48]
     and eax, 0xf000
     cmp eax, S_IFDIR
     jne .reg
@@ -1354,79 +1443,105 @@ fs_rename:
     lea r11, [rel dir_buf]
     mov byte [r11+DIR_DTYPE], DT_REG
 .dtok:
-    mov rax, r15
+    mov rax, [rsp+40]
     lea r11, [rel dir_buf]
     mov [r11+DIR_NAMELEN], al
     lea r11, [rel dir_buf]
     lea rdi, [r11+DIR_NAME]
     mov rsi, [rsp+32]
-    mov rdx, r15
+    mov rdx, [rsp+40]
     call memcpy
     mov rdi, [rsp+24]
     mov rsi, TYPE_DIR
     mov rdx, r12
     lea rcx, [rel dir_buf]
-    mov r8, r15
+    mov r8, [rsp+40]
     add r8, DIR_NAME
     call btree_insert
     test eax, eax
     jnz .ret
-    ; remove old name
-    mov qword [rel scan_dir], 0
     mov rax, [rsp]
     mov [rel scan_dir], rax
     mov rax, [rsp+8]
     mov [rel scan_name], rax
-    ; old length was overwritten. Recover from the name pointer via strlen.
-    mov rdi, [rsp+8]
-    call strlen
+    mov rax, [rsp+16]
     mov [rel scan_nlen], rax
     mov byte [rel scan_found], 0
     lea rdi, [rel dir_on_node]
     xor esi, esi
     call tree_walk
+    test eax, eax
+    jnz .unnew
     cmp byte [rel scan_found], 0
-    je .np
-    mov rax, [rsp]
-    mov rdi, rax
+    je .unnew
+    mov rdi, [rsp]
     mov rsi, TYPE_DIR
     mov rdx, [rel scan_off]
     call btree_delete
-.np:
-    mov eax, [rsp+16]
+    test eax, eax
+    jnz .unnew
+    mov eax, [rsp+48]
     and eax, 0xf000
     cmp eax, S_IFDIR
     jne .ok
+    mov rdi, rbx
+    call load_ino
+    test eax, eax
+    jnz .ret
     mov rax, [rsp+24]
     lea r11, [rel ino_buf]
     mov [r11+INO_PARENT], rax
     mov rdi, rbx
     call save_ino
-    ; nlink adjust if parents differ
+    test eax, eax
+    jnz .ret
     mov rax, [rsp]
     cmp rax, [rsp+24]
     je .ok
     mov rdi, [rsp]
     call load_ino
+    test eax, eax
+    jnz .ret
     lea r11, [rel ino_buf]
     dec dword [r11+INO_NLINK]
     mov rdi, [rsp]
     call save_ino
+    test eax, eax
+    jnz .ret
     mov rdi, [rsp+24]
     call load_ino
+    test eax, eax
+    jnz .ret
     lea r11, [rel ino_buf]
     inc dword [r11+INO_NLINK]
     mov rdi, [rsp+24]
     call save_ino
+    jmp .ret
+.unnew:
+    mov r15, rax
+    test r15, r15
+    jnz .unhave
+    mov r15, -EIO
+.unhave:
+    mov rdi, [rsp+24]
+    mov rsi, TYPE_DIR
+    mov rdx, r12
+    call btree_delete
+    mov rax, r15
+    jmp .ret
 .ok:
     xor eax, eax
     jmp .ret
-.exist:
-    mov rax, -EEXIST
+.inval:
+    mov rax, -EINVAL
     jmp .ret
-.aserr:
+.long:
+    mov rax, -ENAMETOOLONG
+    jmp .ret
+.io:
+    mov rax, -EIO
 .ret:
-    EPILOGUE 40
+    EPILOGUE 56
 
 ; Readdir cursor: 0 -> ".", 1 -> "..", then real entries in tree order.
 ; rdi dir, rsi cookie, rdx buf (name out, max 256), rcx out_ino, r8 out_type
@@ -1541,16 +1656,79 @@ readdir_on_node:
     xor eax, eax
     EPILOGUE 8
 
-meta_on_node:
-    mov rax, [rel meta_n]
-    cmp rax, 2048
-    jae .d
-    lea r11, [rel meta_bn]
-    mov [r11+rax*8], rsi
-    inc qword [rel meta_n]
-.d:
+; rdi = block, rsi = depth. Overwrite this node after its children.
+wipe_rec:
+    PROLOGUE 824
+    mov r12, rdi
+    mov rbx, rsi
+    xor r15, r15
+    cmp r12, 2
+    jb .ok
+    cmp r12, [rel fs_total]
+    jae .ok
+    cmp rbx, MAX_TREE_DEPTH
+    jb .read
+    mov r15, -EIO
+    jmp .shred
+.read:
+    mov rdi, r12
+    lea rsi, [rel node_io]
+    call node_read
+    test eax, eax
+    jz .kids
+    mov r15, rax
+    jmp .shred
+.kids:
+    lea r11, [rel node_io]
+    cmp byte [r11+NH_LEVEL], 0
+    je .shred
+    movzx r13, word [r11+NH_NITEMS]
+    test r13, r13
+    jz .shred
+    cmp r13, MAX_INT_ITEMS
+    ja .shred
+    xor r14, r14
+.cp:
+    cmp r14, r13
+    jae .go
+    mov rcx, r14
+    imul rcx, INT_IH
+    lea r11, [rel node_io+PAYLOAD_OFF]
+    mov rax, [r11+rcx+II_CHILD]
+    mov [rsp+r14*8], rax
+    inc r14
+    jmp .cp
+.go:
+    xor r14, r14
+.rc:
+    cmp r14, r13
+    jae .shred
+    mov rdi, [rsp+r14*8]
+    lea rsi, [rbx+1]
+    call wipe_rec
+    test eax, eax
+    jz .nc
+    mov r15, rax
+.nc:
+    inc r14
+    jmp .rc
+.shred:
+    lea rdi, [rel node_io]
+    mov esi, BLOCK_SIZE
+    call fill_random
+    test eax, eax
+    jnz .ret
+    mov rdi, r12
+    lea rsi, [rel node_io]
+    call block_write
+    test eax, eax
+    jnz .ret
+    mov rax, r15
+    jmp .ret
+.ok:
     xor eax, eax
-    ret
+.ret:
+    EPILOGUE 824
 
 ; rdi = path
 fs_wipe:
@@ -1558,23 +1736,13 @@ fs_wipe:
     call fs_prepare_admin
     test eax, eax
     jnz .ret
-    mov qword [rel meta_n], 0
-    lea rdi, [rel meta_on_node]
+    xor ebx, ebx
+    mov rdi, [rel fs_root]
+    test rdi, rdi
+    jz .keys
     xor esi, esi
-    call tree_walk
-    xor rbx, rbx
-.ow:
-    cmp rbx, [rel meta_n]
-    jae .keys
-    lea rdi, [rel node_io]
-    mov esi, BLOCK_SIZE
-    call fill_random
-    lea r11, [rel meta_bn]
-    mov rdi, [r11+rbx*8]
-    lea rsi, [rel node_io]
-    call block_write
-    inc rbx
-    jmp .ow
+    call wipe_rec
+    mov ebx, eax
 .keys:
     lea rdi, [rel fs_salt]
     xor esi, esi
@@ -1599,7 +1767,10 @@ fs_wipe:
     mov qword [rel fs_root], 0
     mov dword [rel fs_flags], FLAG_WIPED
     call super_store
+    test eax, eax
+    jz .wiped
     mov ebx, eax
+.wiped:
     call fs_close
     mov eax, ebx
 .ret:

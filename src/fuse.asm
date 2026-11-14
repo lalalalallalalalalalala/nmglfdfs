@@ -247,6 +247,8 @@ fuse_loop:
     lea rsi, [rel fuse_in]
     mov rdx, FUSE_BUFSZ
     syscall
+    cmp rax, -4                ; -EINTR: stay up and read the next request
+    je .l
     cmp rax, 0
     jle .done
     cmp rax, FUSE_IN_HEADER
